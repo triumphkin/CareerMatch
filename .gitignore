@@ -1,0 +1,10 @@
+.env
+.venv/
+.cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+GEMINI.md
+AGENTS.md
+CLAUDE.md
+TheBlueprint.md
