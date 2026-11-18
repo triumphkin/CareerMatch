@@ -4,15 +4,15 @@ services:
     container_name: careermatch-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-careermatch}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-careermatch}
-      POSTGRES_DB: ${POSTGRES_DB:-careermatch}
+      POSTGRES_USER: careermatch
+      POSTGRES_PASSWORD: careermatch
+      POSTGRES_DB: careermatch
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-careermatch} -d ${POSTGRES_DB:-careermatch}"]
+      test: ["CMD", "pg_isready", "-U", "careermatch"]
       interval: 5s
       timeout: 5s
       retries: 10
