@@ -158,3 +158,10 @@ class DiscoveryQueryPlan(BaseModel):
     fallback_broad_query: str
     rationale: str
 
+
+class VerificationFeedbackItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    issues: list[str]
+    required_action: str
