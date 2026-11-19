@@ -165,3 +165,18 @@ class VerificationFeedbackItem(BaseModel):
     job_id: str
     issues: list[str]
     required_action: str
+
+
+class VerificationVerdictItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    verdict: DecisionType
+    issues: list[str]
+    feedback_for_matching: str
+
+
+class VerificationVerdictBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    verdicts: list[VerificationVerdictItem]
