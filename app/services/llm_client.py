@@ -15,9 +15,11 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, Self, TypeVar
 from urllib.parse import quote, quote_plus
@@ -90,6 +92,157 @@ def _provider_diagnostic(error: errors.APIError, api_key: str) -> str:
 
 class GeminiResponseError(RuntimeError):
     """A response or cache record violates the provider's output contract."""
+
+
+class CostBudgetExceeded(Exception):
+    """No paid request was started because its maximum charge would not fit."""
+
+
+class CostAccountingError(Exception):
+    """Spending is uncertain; retain the reservation and stop paid requests."""
+
+
+class RequestAccounting:
+    """Opt-in, thread-safe ledger for physical requests, including failed output.
+
+    Reserve the provider's full advertised input limit and a capped output limit.
+    This deliberately stops early when the remaining budget cannot cover a whole
+    request. Unknown charges retain their reservation, never become zero dollars.
+    Callbacks receive only cost/token/provenance metadata, never input or output.
+    """
+
+    def __init__(self, limit_usd: float, *, max_output_tokens=8192, on_change=None):
+        if not math.isfinite(limit_usd) or limit_usd < 0:
+            raise ValueError("Cost limit must be finite and nonnegative")
+        if type(max_output_tokens) is not int or max_output_tokens <= 0:
+            raise ValueError("Output token cap must be positive")
+        self.limit = Decimal(str(limit_usd))
+        self.max_output_tokens = max_output_tokens
+        self.records = []
+        self._lock = threading.RLock()
+        self._on_change = on_change
+
+    def snapshot(self):
+        with self._lock:
+            return deepcopy(self.records)
+
+    def _notify(self):
+        if self._on_change is not None:
+            self._on_change(self.snapshot())
+
+    def reserve(self, amount: float, model_id: str) -> int:
+        if not math.isfinite(amount) or amount < 0:
+            raise ValueError("Reservation must be finite and nonnegative")
+        with self._lock:
+            if any(r["usage"] is None for r in self.records):
+                raise CostAccountingError("Unsettled request; refusing more spending")
+            spent = sum(
+                (Decimal(str(r["reserved_usd"])) for r in self.records), Decimal(0)
+            )
+            if spent + Decimal(str(amount)) > self.limit or spent >= self.limit:
+                raise CostBudgetExceeded(
+                    "Request reservation exceeds remaining evaluation budget"
+                )
+            self.records.append(
+                {
+                    "model_id": model_id,
+                    "reserved_usd": amount,
+                    "usage": None,
+                    "physical_request": True,
+                }
+            )
+            self._notify()
+            return len(self.records) - 1
+
+    def settle(self, ticket: int, usage: LLMUsageMeta) -> None:
+        with self._lock:
+            record = self.records[ticket]
+            if record["usage"] is not None:
+                raise CostAccountingError("Request already settled")
+            over = usage.estimated_cost_usd > record["reserved_usd"] + 1e-12
+            record["usage"] = usage.model_dump(mode="json")
+            record["reserved_usd"] = usage.estimated_cost_usd
+            self._notify()
+            if over:
+                raise CostAccountingError(
+                    "Provider usage exceeded its advertised request bound"
+                )
+
+    def record_free(self, usage: LLMUsageMeta) -> None:
+        if usage.estimated_cost_usd or usage.total_tokens:
+            raise ValueError("Free receipt must have zero new tokens and cost")
+        with self._lock:
+            self.records.append(
+                {
+                    "model_id": usage.model_id,
+                    "reserved_usd": 0.0,
+                    "usage": usage.model_dump(mode="json"),
+                    "physical_request": False,
+                }
+            )
+            self._notify()
+
+    def note_failure(
+        self, ticket: int, *, category: str, http_status=None, api_status=None
+    ):
+        """Persist allowlisted diagnostics, never provider messages or requests.
+
+        Keep the unsettled reservation intact. A diagnostic is not evidence that
+        the request was free, and must not enable another paid attempt.
+        """
+        if category not in {
+            "http_error",
+            "timeout",
+            "transport_error",
+            "connection_error",
+            "invalid_usage",
+            "missing_usage",
+        }:
+            raise ValueError("Unknown provider failure category")
+        safe_http = (
+            http_status
+            if type(http_status) is int and 100 <= http_status <= 599
+            else None
+        )
+        allowed_statuses = {
+            "INVALID_ARGUMENT",
+            "FAILED_PRECONDITION",
+            "UNAUTHENTICATED",
+            "PERMISSION_DENIED",
+            "NOT_FOUND",
+            "RESOURCE_EXHAUSTED",
+            "INTERNAL",
+            "UNAVAILABLE",
+            "DEADLINE_EXCEEDED",
+            "CANCELLED",
+        }
+        safe_api = (
+            api_status
+            if isinstance(api_status, str) and api_status in allowed_statuses
+            else None
+        )
+        with self._lock:
+            self.records[ticket]["failure"] = {
+                "category": category,
+                "http_status": safe_http,
+                "api_status": safe_api,
+            }
+            self._notify()
+
+
+_ACCOUNTING: ContextVar[RequestAccounting | None] = ContextVar(
+    "gemini_accounting", default=None
+)
+
+
+@contextmanager
+def account_requests(ledger: RequestAccounting):
+    """Apply one ledger to all synchronous services in this execution context."""
+    token = _ACCOUNTING.set(ledger)
+    try:
+        yield ledger
+    finally:
+        _ACCOUNTING.reset(token)
 
 
 class _RateLimiter:
@@ -351,6 +504,84 @@ class GeminiService:
         usage = getattr(self._local, "embedding_usage", None)
         return usage.model_copy(deep=True) if usage is not None else None
 
+    @property
+    def last_generation_usage(self) -> LLMUsageMeta | None:
+        """Usage survives malformed/truncated structured output; thread-local."""
+        usage = getattr(self._local, "generation_usage", None)
+        return usage.model_copy(deep=True) if usage is not None else None
+
+    def _accounted_request(
+        self, call, *, model_id, operation, usage_of, input_count=1, config=None
+    ):
+        ledger = _ACCOUNTING.get()
+        if ledger is None:
+            response = self._request(call, operation=operation)
+            return response, usage_of(response)
+        # Model metadata is a non-generating request. A missing/invalid limit
+        # blocks evaluation rather than substituting a guessed token estimate.
+        model = self._request(
+            lambda: self._client.models.get(model=model_id), operation="model_limits"
+        )
+        input_limit = model.input_token_limit
+        if type(input_limit) is not int or input_limit <= 0:
+            raise CostAccountingError("Provider omitted model input limit")
+        if config is not None:
+            output_limit = model.output_token_limit
+            if type(output_limit) is not int or output_limit <= 0:
+                raise CostAccountingError("Provider omitted model output limit")
+            config.max_output_tokens = min(ledger.max_output_tokens, output_limit)
+            input_rate, output_rate = _chat_rates(model_id)
+            maximum = (
+                input_limit * input_rate + config.max_output_tokens * output_rate
+            ) / 1_000_000
+        else:
+            maximum = input_count * input_limit * 0.20 / 1_000_000
+        ticket = ledger.reserve(maximum, model_id)
+
+        def once():
+            try:
+                return call()
+            except errors.APIError as error:
+                ledger.note_failure(
+                    ticket,
+                    category="http_error",
+                    http_status=error.code,
+                    api_status=error.status,
+                )
+                raise CostAccountingError(
+                    "Provider HTTP request failed without a usage receipt"
+                ) from None
+            except (
+                httpx.TransportError,
+                TimeoutError,
+                ConnectionError,
+            ) as error:
+                category = (
+                    "timeout"
+                    if isinstance(error, (httpx.TimeoutException, TimeoutError))
+                    else "connection_error"
+                    if isinstance(error, ConnectionError)
+                    else "transport_error"
+                )
+                ledger.note_failure(ticket, category=category)
+                # No usage receipt means no safe retry: the first attempt may
+                # already have been billed. Keep its conservative reservation.
+                raise CostAccountingError(
+                    "Provider attempt failed without a usage receipt"
+                ) from None
+
+        response = self._request(once, operation=operation)
+        try:
+            usage = usage_of(response)
+        except GeminiResponseError:
+            ledger.note_failure(ticket, category="invalid_usage")
+            raise
+        if usage is None:
+            ledger.note_failure(ticket, category="missing_usage")
+            raise CostAccountingError("Provider omitted billable usage")
+        ledger.settle(ticket, usage)
+        return response, usage
+
     def _request(self, call: Callable[[], R], *, operation: str) -> R:
         # Correlate concurrent requests without logging keys, inputs, responses,
         # or exception text. Timings are telemetry, not deterministic model output.
@@ -445,6 +676,10 @@ class GeminiService:
             schema,
             [hashlib.sha256(data).hexdigest() for data in images],
         ]
+        if _ACCOUNTING.get() is not None:
+            components.append(
+                {"max_output_tokens": _ACCOUNTING.get().max_output_tokens}
+            )
         return hashlib.sha256(
             json.dumps(
                 components, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -548,6 +783,7 @@ class GeminiService:
         thinking_level: Literal["LOW", "MEDIUM", "HIGH"] = "MEDIUM",
         image_bytes_list: list[bytes] | None = None,
     ) -> tuple[T, LLMUsageMeta]:
+        self._local.generation_usage = None
         if self._closed:
             raise RuntimeError("GeminiService is closed")
         if not isinstance(prompt, str) or not isinstance(system_instruction, str):
@@ -577,12 +813,17 @@ class GeminiService:
         with _FLIGHT_LOCKS[int(key[:8], 16) % len(_FLIGHT_LOCKS)]:
             cached = self._read_cache(key, response_schema)
             if cached is not None:
+                self._local.generation_usage = cached[1]
+                if _ACCOUNTING.get() is not None:
+                    _ACCOUNTING.get().record_free(cached[1])
                 return cached
             if self.used_mock_fallback:
                 output = response_schema.model_validate(
                     _mock_value(schema, schema, key)
                 )
                 usage = LLMUsageMeta(model_id=selected_model, used_mock_fallback=True)
+                if _ACCOUNTING.get() is not None:
+                    _ACCOUNTING.get().record_free(usage)
             else:
                 parts = [types.Part.from_text(text=prompt)] if prompt else []
                 parts.extend(
@@ -595,13 +836,22 @@ class GeminiService:
                     response_mime_type="application/json",
                     response_schema=_gemini_response_schema(schema),
                 )
-                response = self._request(
+
+                def capture_usage(response):
+                    usage = self._usage(response, selected_model)
+                    self._local.generation_usage = usage
+                    return usage
+
+                response, usage = self._accounted_request(
                     lambda: self._client.models.generate_content(
                         model=selected_model,
                         contents=[types.Content(role="user", parts=parts)],
                         config=config,
                     ),
                     operation=f"generate_content/{selected_model}",
+                    model_id=selected_model,
+                    usage_of=capture_usage,
+                    config=config,
                 )
                 candidates = response.candidates or []
                 if candidates and candidates[0].finish_reason not in (
@@ -629,7 +879,7 @@ class GeminiService:
                     raise GeminiResponseError(
                         "Gemini output did not match response_schema"
                     ) from None
-                usage = self._usage(response, selected_model)
+            self._local.generation_usage = usage
             self._write_cache(key, output, usage)
             return output, usage
 
@@ -652,6 +902,8 @@ class GeminiService:
             self._local.embedding_usage = LLMUsageMeta(
                 model_id=model_id, used_mock_fallback=self.used_mock_fallback
             )
+            if _ACCOUNTING.get() is not None:
+                _ACCOUNTING.get().record_free(self._local.embedding_usage)
             return [_offline_embedding(value) for value in texts]
         if any(not value.strip() for value in texts):
             raise ValueError("Live embedding inputs must be nonempty strings")
@@ -663,7 +915,39 @@ class GeminiService:
                 types.Content(parts=[types.Part.from_text(text=value)])
                 for value in texts[start : start + 50]
             ]
-            response = self._request(
+
+            def capture_usage(response):
+                nonlocal prompt_tokens, usage_known
+                metadata = response.usage_metadata
+                if metadata is None or metadata.prompt_token_count is None:
+                    usage_known = False
+                    self._local.embedding_usage = None
+                    return None
+                count = metadata.prompt_token_count
+                if count < 0:
+                    raise GeminiResponseError(
+                        "Gemini returned invalid embedding token usage"
+                    )
+                prompt_tokens += count
+                usage = LLMUsageMeta(
+                    model_id=model_id,
+                    prompt_tokens=count,
+                    total_tokens=count,
+                    estimated_cost_usd=count * 0.20 / 1_000_000,
+                )
+                self._local.embedding_usage = (
+                    LLMUsageMeta(
+                        model_id=model_id,
+                        prompt_tokens=prompt_tokens,
+                        total_tokens=prompt_tokens,
+                        estimated_cost_usd=prompt_tokens * 0.20 / 1_000_000,
+                    )
+                    if usage_known
+                    else None
+                )
+                return usage
+
+            response, _usage = self._accounted_request(
                 lambda chunk=chunk: self._client.models.embed_content(
                     model=model_id,
                     contents=chunk,
@@ -672,6 +956,9 @@ class GeminiService:
                     ),
                 ),
                 operation=f"embed_content/{model_id}",
+                model_id=model_id,
+                usage_of=capture_usage,
+                input_count=len(chunk),
             )
             embeddings = response.embeddings
             if (
@@ -697,24 +984,4 @@ class GeminiService:
                 if math.hypot(*values) == 0:
                     raise GeminiResponseError("Gemini returned a zero embedding")
                 results.append([float(value) for value in values])
-            metadata = response.usage_metadata
-            if metadata is not None and metadata.prompt_token_count is not None:
-                if metadata.prompt_token_count < 0:
-                    raise GeminiResponseError(
-                        "Gemini returned invalid embedding token usage"
-                    )
-                prompt_tokens += metadata.prompt_token_count
-            else:
-                usage_known = False
-            self._local.embedding_usage = (
-                LLMUsageMeta(
-                    model_id=model_id,
-                    prompt_tokens=prompt_tokens,
-                    total_tokens=prompt_tokens,
-                    estimated_cost_usd=prompt_tokens * 0.20 / 1_000_000,
-                    used_mock_fallback=False,
-                )
-                if usage_known
-                else None
-            )
         return results
