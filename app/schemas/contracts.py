@@ -149,3 +149,12 @@ class LLMUsageMeta(BaseModel):
     estimated_cost_usd: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     cached: bool = False
     used_mock_fallback: bool = False
+
+
+class DiscoveryQueryPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary_query: str
+    fallback_broad_query: str
+    rationale: str
+
