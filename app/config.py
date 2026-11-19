@@ -20,7 +20,8 @@ class Settings(BaseSettings):
         repr=False,
     )
     GEMINI_API_KEY: str = Field(default="", repr=False)
-    CHAT_MODEL_ID: str = Field(default="gemini-3.8-flash", min_length=1)
+    # CHAT_MODEL_ID: str = Field(default="gemini-3.8-flash", min_length=1)
+    CHAT_MODEL_ID: str = Field(default="gemini-3.5-flash-lite", min_length=1)
     CHAT_MODEL_ID_FAST: str = Field(default="gemini-3.5-flash-lite", min_length=1)
     EMBEDDING_MODEL_ID: str = Field(default="gemini-embedding-2", min_length=1)
     EMBEDDING_DIM: int = Field(default=768, gt=0)
